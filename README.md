@@ -1,16 +1,14 @@
-## Hi there 👋
 
-<!--
-**tran1008/tran1008** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+                                        Hi 👋, I'm Huy
 
-Here are some ideas to get you started:
+👋 WELCOME TO HUY's GitHub
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+🔭 My name is Huy - a junior at the University of Science.
+
+✨ I'm currently learning about web/app development including UX/UI design, front-end, and backend coding by using ReactJS, NodeJs, and database.
+
+⚡ Fun fact I love coding and playing soccer. 
+
+🌱 My dream job in the future is IT Devops.
+
+📫 Contact me: huy01652768373@gmail.com
