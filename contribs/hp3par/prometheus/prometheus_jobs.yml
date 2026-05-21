@@ -1,0 +1,16 @@
+#--------- Start prometheus hp3par exporter  ---------#
+  - job_name: "hp3par"
+    metrics_path: /metrics
+    file_sd_configs:
+      - files: [ "/etc/prometheus/hp3par_nodes/*.yml" ]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      # use the value set in __tmp_source_host as exporter host name
+      - source_labels: [__tmp_exporter_host]
+        target_label: __address__
+      # or directly:
+      # - target_label: __address__
+      #   replacement: "hp3par_exporter_host.domain.name:9321"  # The hp3par exporter's real hostname.
+
+#--------- End prometheus hp3par exporter ---------#

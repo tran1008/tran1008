@@ -1,0 +1,250 @@
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
+)
+
+const (
+	contentTypeHeader     = "Content-Type"
+	contentLengthHeader   = "Content-Length"
+	contentEncodingHeader = "Content-Encoding"
+	acceptEncodingHeader  = "Accept-Encoding"
+	acceptHeader          = "Accept"
+	applicationJSON       = "application/json"
+	textHTML              = "text/html"
+	textPLAIN             = "text/plain"
+)
+
+// ExporterHandlerFor returns an http.Handler for the provided Exporter.
+func ExporterHandlerFor(exporter Exporter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var (
+			err    error
+			target Target
+			tmp_t  *TargetConfig
+		)
+
+		params := req.URL.Query()
+		tName := strings.TrimSpace(params.Get("target"))
+		if tName == "" || tName == "template" {
+			err := errors.New("Target parameter is missing")
+			HandleError(http.StatusBadRequest, err, *metricsPath, exporter, w, req)
+			return
+		}
+
+		target, err = exporter.FindTarget(tName)
+		if err == ErrTargetNotFound {
+			model := strings.TrimSpace(params.Get("model"))
+			if model == "" {
+				model = "default"
+			}
+			t_def, err := exporter.FindTarget(model)
+			if err != nil {
+				err := fmt.Errorf("Target model '%s' not found: %s", model, err)
+				HandleError(http.StatusNotFound, err, *metricsPath, exporter, w, req)
+				return
+			}
+			if tmp_t, err = t_def.Config().Clone(tName, ""); err != nil {
+				err := fmt.Errorf("invalid url set for remote_target '%s' %s", tName, err)
+				HandleError(http.StatusInternalServerError, err, *metricsPath, exporter, w, req)
+				return
+			}
+			tmp_t.targetType = TargetTypeDynamic
+			target, err = exporter.AddTarget(tmp_t)
+			if err != nil {
+				err := fmt.Errorf("unable to create temporary target %s", err)
+				HandleError(http.StatusInternalServerError, err, *metricsPath, exporter, w, req)
+				return
+			}
+			exporter.Config().Targets = append(exporter.Config().Targets, tmp_t)
+		} else if err != nil {
+			HandleError(http.StatusNotFound, err, *metricsPath, exporter, w, req)
+			return
+		}
+
+		// set a specific collector_name for target
+		if len(params["collector"]) > 0 {
+			// to store anc check name uniqueness
+			collectors := make(map[string]*CollectorConfig, len(params["collector"]))
+			for _, collector_name := range params["collector"] {
+				if _, ok := collectors[collector_name]; !ok {
+					coll := exporter.Config().FindCollector(collector_name)
+					if coll != nil {
+						exporter.Config().logger.Debug(fmt.Sprintf("adding specific collector %s", collector_name),
+							"target", target.Name())
+						// target.SetSymbol("collector_name", collector_name)
+					} else {
+						err := fmt.Errorf("collector name '%s' not found", collector_name)
+						HandleError(http.StatusNotFound, err, *metricsPath, exporter, w, req)
+						return
+					}
+					collectors[collector_name] = coll
+				}
+			}
+			if err := target.SetSpecificCollectorConfig(collectors); err != nil {
+				HandleError(http.StatusNotFound, err, *metricsPath, exporter, w, req)
+				return
+			}
+		}
+
+		// set authentication for target if one is specified and it differs from target internal
+		auth_name := params.Get("auth_name")
+		if auth_name != "" && target.Config().AuthName != auth_name {
+			auth := exporter.Config().FindAuthConfig(auth_name)
+			if auth != nil {
+				target.Config().AuthConfig = *auth
+				target.SetSymbol("auth_mode", auth.Mode)
+				target.SetSymbol("user", auth.Username)
+				target.SetSymbol("password", string(auth.Password))
+				target.SetSymbol("auth_token", string(auth.Token))
+				target.Config().AuthName = auth_name
+			}
+		}
+
+		auth_key := params.Get("auth_key")
+		if auth_key != "" {
+			target.SetSymbol("auth_key", auth_key)
+		}
+		health_only := false
+		health_only_str := params.Get("health")
+		if strings.ToLower(health_only_str) == "true" {
+			health_only = true
+		}
+
+		ctx, cancel := contextFor(req, exporter, target)
+		defer func() {
+			cancel()
+		}()
+
+		// Go through prometheus.Gatherers to sanitize and sort metrics.
+		gatherer := prometheus.Gatherers{exporter.WithContext(ctx, target, health_only)}
+		mfs, err := gatherer.Gather()
+		if err != nil {
+			exporter.Logger().Error(
+				fmt.Sprintf("Error gathering metrics for '%s': %s", tName, err))
+			if len(mfs) == 0 {
+				http.Error(w, "No metrics gathered, "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		contentType := expfmt.Negotiate(req.Header)
+		buf := getBuf()
+		defer giveBuf(buf)
+		writer, encoding := decorateWriter(req, buf)
+		enc := expfmt.NewEncoder(writer, contentType)
+		var errs prometheus.MultiError
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				errs = append(errs, err)
+				exporter.Logger().Info(
+					fmt.Sprintf("Error encoding metric family %q: %s", mf.GetName(), err.Error()))
+			}
+		}
+		if closer, ok := writer.(io.Closer); ok {
+			closer.Close()
+		}
+		if errs.MaybeUnwrap() != nil && buf.Len() == 0 {
+			err = fmt.Errorf("no metrics encoded: %s, ", errs.Error())
+			HandleError(http.StatusInternalServerError, err, *metricsPath, exporter, w, req)
+			return
+		}
+		header := w.Header()
+		header.Set(contentTypeHeader, string(contentType))
+		header.Set(contentLengthHeader, fmt.Sprint(buf.Len()))
+		if encoding != "" {
+			header.Set(contentEncodingHeader, encoding)
+		}
+		w.Write(buf.Bytes())
+	})
+}
+
+func contextFor(req *http.Request, exporter Exporter, target Target) (context.Context, context.CancelFunc) {
+	timeout := time.Duration(0)
+	timeout_with_offset := timeout
+	configTimeout := time.Duration(target.Config().ScrapeTimeout)
+	// If a timeout is provided in the Prometheus header, use it.
+	if v := req.Header.Get("X-Prometheus-Scrape-Timeout-Seconds"); v != "" {
+		timeoutSeconds, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			exporter.Logger().Error(
+				fmt.Sprintf("Failed to parse timeout (`%s`) from Prometheus header: %s", v, err.Error()))
+		} else {
+			timeout = time.Duration(timeoutSeconds * float64(time.Second))
+			timeout_with_offset = timeout
+
+			// Subtract the timeout offset, unless the result would be negative or zero.
+			timeoutOffset := time.Duration(exporter.Config().Globals.TimeoutOffset)
+			if timeoutOffset > timeout {
+				exporter.Logger().Error(
+					fmt.Sprintf("global.scrape_timeout_offset (`%s`) is greater than Prometheus' scraping timeout (`%s`), ignoring",
+						timeoutOffset, timeout))
+			} else {
+				timeout_with_offset -= timeoutOffset
+			}
+		}
+	}
+
+	// If the configured scrape timeout is more restrictive, use that instead.
+	if configTimeout > 0 && (timeout <= 0 || configTimeout < timeout) {
+		timeout = configTimeout
+		timeout_with_offset = timeout
+	}
+
+	// no timeout at all, so set deadline to now by convention
+	if timeout <= 0 {
+		target.SetDeadline(time.Time{})
+		return context.Background(), func() {}
+	}
+
+	exporter.Logger().Debug(
+		fmt.Sprintf("launching exporter.Gather() for target '%s' with timeout `%s`", target.Name(), timeout_with_offset))
+	target.SetTimeout(timeout)
+	target.SetDeadline(time.Now().Add(timeout_with_offset))
+
+	return context.WithDeadline(context.Background(), target.GetDeadline())
+	// return context.WithTimeout(context.Background(), timeout)
+}
+
+var bufPool sync.Pool
+
+func getBuf() *bytes.Buffer {
+	buf := bufPool.Get()
+	if buf == nil {
+		return &bytes.Buffer{}
+	}
+	return buf.(*bytes.Buffer)
+}
+
+func giveBuf(buf *bytes.Buffer) {
+	buf.Reset()
+	bufPool.Put(buf)
+}
+
+// decorateWriter wraps a writer to handle gzip compression if requested.  It
+// returns the decorated writer and the appropriate "Content-Encoding" header
+// (which is empty if no compression is enabled).
+func decorateWriter(request *http.Request, writer io.Writer) (w io.Writer, encoding string) {
+	header := request.Header.Get(acceptEncodingHeader)
+	parts := strings.Split(header, ",")
+	for _, part := range parts {
+		part := strings.TrimSpace(part)
+		if part == "gzip" || strings.HasPrefix(part, "gzip;") {
+			return gzip.NewWriter(writer), "gzip"
+		}
+	}
+	return writer, ""
+}

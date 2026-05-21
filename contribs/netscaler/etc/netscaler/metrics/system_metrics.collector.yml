@@ -1,0 +1,148 @@
+---
+
+##
+## url: https://developer-docs.citrix.com/projects/netscaler-nitro-api/en/12.0/statistics/system/system/
+## url: https://developer-docs.netscaler.com/en-us/adc-nitro-api/current-release/statistics/system/system
+##
+### Statistics for system.
+#
+
+
+collector_name: netscaler_system_metrics
+metric_prefix: citrixadc_system
+
+scripts:
+  get stat_system:
+    - name: collect stat system
+      query:
+        url: /stat/system
+        var_name: results
+        # debug: true
+
+    - name: proceed cpu elements
+      scope: results.system
+      metrics:
+        - metric_name: cpu_count
+          help: number of cpu for appliance (constant)
+          type: gauge
+          values:
+            _: $numcpus
+
+        - metric_name: cpu_usage_percent
+          help: instant value for cpu usage percent
+          type: gauge
+          values:
+            _: $cpuusagepcnt
+
+        - metric_name: management_cpu_usage_percent
+          help: instant value for cpu management usage percent 
+          type: gauge
+          values:
+            _: $mgmtcpuusagepcnt
+
+        - metric_name: packet_cpu_usage_percent
+          help: instant value for cpu packet proccessing usage percent
+          type: gauge
+          values:
+            _: $pktcpuusagepcnt
+
+        - metric_name: res_cpu_usage_percent
+          help: instant value for cpu response proccessing usage percent
+          type: gauge
+          values:
+            _: $rescpuusagepcnt
+
+    - name: proceed disk elements
+      metric_prefix: citrixadc_system_disk
+      scope: results.system
+      metrics:
+        - metric_name: free_bytes
+          help: partition available bytes
+          type: gauge
+          key_labels:
+            mount: /var
+          values:
+            _: '{{ convertToBytes .disk1avail "Mb" }}'
+
+        - metric_name: used_bytes
+          help: partition used bytes
+          type: gauge
+          key_labels:
+            mount: /var
+          values:
+            _: '{{ convertToBytes .disk1used "Mb" }}'
+
+        - metric_name: total_bytes
+          help: partition total bytes
+          type: gauge
+          key_labels:
+            mount: /var
+          values:
+            _: '{{ convertToBytes .disk1size "Mb" }}'
+
+        - metric_name: free_bytes
+          help: partition available bytes
+          key_labels:
+            mount: /flash
+          type: gauge
+          values:
+            _: '{{ convertToBytes .disk0avail "Mb" }}'
+
+        - metric_name: used_bytes
+          help: partition used bytes
+          type: gauge
+          key_labels:
+            mount: /flash
+          values:
+            _: '{{ convertToBytes .disk0used "Mb" }}'
+
+        - metric_name: total_bytes
+          help: partition total bytes
+          type: gauge
+          key_labels:
+            mount: /flash
+          values:
+            _: '{{ convertToBytes .disk0size "Mb" }}'
+
+        - metric_name: used_percent
+          help: instant value for partition used percent
+          type: gauge
+          key_labels:
+            mount: /var
+          values:
+            _: $disk1perusage
+
+        - metric_name: used_percent
+          help: instant value for partition used percent
+          key_labels:
+            mount: /flash
+          type: gauge
+          values:
+            _: $disk0perusage
+
+        # collect in systemmemory_metrics.collector
+        # - metric_name: memory_usage_percent
+        #   help: instant value for memory usage percent
+        #   type: gauge
+        #   values:
+        #     _: memusagepcnt
+
+    - name: proceed system
+      metric_prefix: citrixadc_system
+      scope: results.system
+      metrics:
+        - metric_name: start_timestamp
+          help: Time (unix epoch) when the Citrix ADC was last started.
+          type: gauge
+          # format: "Wed Nov 22 11:51:04 2023"
+          values:
+            _: '{{ mustToDate "Mon Jan _2 15:04:05 2006" .starttime | unixEpoch }}'
+
+        # - metric_name: uptime
+        #   help: Seconds since the Citrix ADC started.
+        #   type: gauge
+        #   values:
+        #     _: $timesincestart
+
+...
+

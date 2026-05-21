@@ -1,0 +1,16 @@
+/.project
+/.settings
+
+/.vscode/
+/*.code-workspace
+
+/my_tests
+/config/
+/cmd
+
+/httpapi_exporter
+/passwd_encrypt
+/*.exe
+
+/*.tar.gz
+/*.zip

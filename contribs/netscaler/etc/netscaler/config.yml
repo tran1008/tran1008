@@ -1,0 +1,161 @@
+# Global defaults.
+global:
+  # max timeout for the exporter: if prometheus sends a value greater than scrape_timeout, scrape_timeout will be used
+  scrape_timeout: 30s
+  # Subtracted from Prometheus' scrape_timeout to give us some headroom and prevent Prometheus from timing out first.
+  scrape_timeout_offset: 500ms
+  # Minimum interval between collector runs: by default (0s) collectors are executed on every scrape.
+  min_interval: 0s
+  # all unsuccessful queries will be retried this number of times
+  query_retry: 3
+  # all metrics will be named "[metric_prefix]_[metric_name]"
+  metric_prefix: "citrixadc"
+  # all http codes that will consider the connection has an invalid auth and must do a Login()
+  invalid_auth_code: [401,403]
+  exporter_name: netscaler_exporter
+  # list of allowed tls version, meaning authorized ciphers for https connections
+  #   all, tls_upto_1.2, tls_1.2 ,tls_1.3
+  tls_version: all
+
+profiles:
+  netscaler:
+    scripts:
+      init:
+        - name: default headers
+          set_fact:
+            session_id: ''
+            headers:
+              - name: "Content-Type"
+                value: application/json
+              - name: Accept
+                value: "application/json"
+            base_url: /nitro/v1
+            verifySSL: true
+            #** reload config info every one hour
+            configCacheDuration: 1h
+
+      auth_check:
+        - name: analyze login response ok
+          set_fact:
+            cookies: 
+              - name: "sessionid"
+                value: $login.sessionid
+            logged: true
+            login_retry: $queryRetry
+          when:
+            - 'js: status_code == 201'
+        - name: analyze login response
+          set_fact:
+            logged: false
+            login_retry: $queryRetry
+          when:
+            - 'js: (status_code == 401) || (status_code == 403)'
+        - name: analyze login response not ok with retry
+          set_fact:
+            logged: false
+            login_retry: 'js: ++login_retry'
+          when:
+            - 'js: (status_code != 201) && (status_code != 401) && (status_code != 403)'
+
+      login:
+        - name: init login loop
+          vars:
+            login_retry: 0
+            status_code: 0
+          until: 'js: login_retry < queryRetry'
+
+          actions:
+            - name: login phase
+              query:
+                url: /config/login
+                method: post
+                data: >-
+                  js:
+                    var passwd = exporter.decryptPass( password, auth_key ),
+                        data = {
+                          "login": {
+                            "username": user, 
+                            "password": passwd,
+                          }
+                        };
+                    JSON.stringify(data)
+                ok_status: 201
+                var_name: login
+            - name: analyze login response
+              play_script: auth_check
+
+      # method called to determine if a target is responding; will call login script if necessary
+      # new login phase is determined by http code received : invalid_auth_code ( http 401, 403 usually ) on each query
+      ping:
+        - name: check ping cnx
+          query: 
+            # will call /api in fact !
+            url: /config/nsversion
+            method: get
+            ok_status: 200
+            # to catch and store the result and use it later...
+            var_name: nsversion
+            status: true
+
+        - name: set config cache vars
+          set_fact:
+            config:
+              ts_next_check: 0
+          when: "js: typeof config === 'undefined'"
+
+        - name: set config cache vars
+          when: >-
+            js:
+              typeof config !== 'undefined' && 
+                config.ts_next_check <= Math.floor(new Date().getTime() / 1000) 
+          set_fact:
+            _ : >-
+              js:
+                config.svclb = []
+                config.svcgrplb = []
+                config.cluster = []
+                config.ts_next_check = Math.floor(new Date().getTime() / 1000) + exporter.getDurationSecond( configCacheDuration )
+                // return unused value
+                true
+
+      # script called to reset all login infos after the ping script has received an invalid_auth_code.
+      # remove cookie sessionid and set var logged to false
+      clear:
+        - name: reset session_id
+          set_fact:
+            cookies: 
+              - name: "sessionid"
+                action: delete
+            # or
+            #  sessionid: __delete__
+            logged: false
+
+auth_configs:
+  prometheus_encrypted:
+    mode: script
+    user: prometheus
+    password: "/encrypted/__________XXXXXXX_______________XXXXXXX_______"
+
+# The targets to monitor and the collectors to execute on it.
+targets:
+  # default target is used as a pattern for exporter queries with target name not defined locally.
+  - name: default
+    scheme: https
+    host: template
+    port: 443
+    profile: netscaler
+    auth_name: prometheus_encrypted
+    # auth_config:
+    #   # mode: basic|token|[anything else:=> user defined login script]
+    #   mode: script
+    #   user: usrNetScalerSupervision
+    #   password: "/encrypted/base64_encrypted_password_by_passwd_crypt_cmd"
+    collectors:
+      - ~.*_metrics
+
+  # - targets_files: [ "/etc/httpapi_exporter/netscaler/targets/*.yml" ]
+  - targets_files: [ "/etc/httpapi_exporter/netscaler/targets/*.yml" ]
+
+# Collector files specifies a list of globs. One collector definition is read from each matching file.
+collector_files:
+  - "/etc/httpapi_exporter/netscaler/metrics/*.collector.yml"

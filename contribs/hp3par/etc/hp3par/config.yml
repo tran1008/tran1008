@@ -1,0 +1,142 @@
+# Global defaults.
+global:
+  # max timeout for the exporter: if prometheus sends a value greater than scrape_timeout, scrape_timeout will be used
+  scrape_timeout: 30s
+  # Subtracted from Prometheus' scrape_timeout to give us some headroom and prevent Prometheus from timing out first.
+  scrape_timeout_offset: 500ms
+  # Minimum interval between collector runs: by default (0s) collectors are executed on every scrape.
+  min_interval: 0s
+  # all unsuccessful queries will be retried this number of times
+  query_retry: 3
+  # all metrics will be named "[metric_prefix]_[metric_name]"
+  metric_prefix: "hp3par"
+  # all http codes that will consider the connection has an invalid auth and must do a Login()
+  invalid_auth_code: [401,403]
+  exporter_name: hp3par_exporter
+
+profiles:
+  netscaler:
+    scripts:
+      init:
+        - name: default headers
+          set_fact:
+            headers:
+              - name: "Content-Type"
+                value: application/json
+              - name: Accept
+                value: "application/json"
+            base_url: /api/v1
+            port: 8080
+            verifySSL: false
+            
+            # default values for parameters that you don't want to set for each target
+            # base_url: /api/v1
+            # scheme: https
+            # port: 443
+            # verifySSL: true|false
+            # query_retry: 3
+
+      auth_check:
+        - name: analyze login response ok
+          set_fact:
+            # auth_token: "{{ .login.key }}"
+            headers: 
+              - name: "x-hp3par-wsapi-sessionkey"
+                value: $login.key
+            logged: true
+            login_retry: $queryRetry
+          when:
+            - eq .status_code 201
+            - hasKey .login "key"
+        - name: analyze login response
+          set_fact:
+            # auth_token: ""
+            logged: false
+            login_retry: $queryRetry
+            headers: 
+              - name: "x-hp3par-wsapi-sessionkey"
+                action: delete
+          when:
+            - 'js: status_code == 401 || status_code == 403'
+        - name: analyze login response not ok with retry
+          set_fact:
+            # auth_token: ""
+            logged: false
+            login_retry: 'js: ++login_retry'
+          when:
+            - 'js: status_code != 201 && status_code != 401 && status_code != 403'
+
+      login:
+        - name: init login loop
+          vars:
+            login_retry: 0
+            status_code: 0
+          until: 'js: login_retry < queryRetry'
+
+          actions:
+            - name: login phase
+              query:
+                url: /credentials
+                method: post
+                data: >-
+                  js:
+                    var tmp_pass = exporter.decryptPass(password, auth_key),
+                    data = { "user": user, "password": tmp_pass };
+                    JSON.stringify(data)
+                # data: >-
+                #   {{ $tmp_pass := exporterDecryptPass .password .auth_key }}
+                #   {{ $data := dict "user" .user "password" $tmp_pass }}
+                #   {{ $data | toRawJson }}
+                ok_status: 201
+                var_name: login
+            - name: analyze login response
+              play_script: auth_check
+
+      # script called to reset all login infos after the ping script has received an invalid_auth_code.
+      # remove specific header and set var logged to false
+      clear:
+        - name: reset auth element
+          set_fact:
+            logged: false
+            headers: 
+              - name: "x-hp3par-wsapi-sessionkey"
+                action: delete
+
+      # method called to determine if a target is responding; will call login script if necessary
+      # new login phase is determined by http code received : invalid_auth_code ( http 401, 403 usually )
+      ping:
+        - name: check ping cnx
+          query: 
+            url: /wsapiconfiguration
+            method: get
+            ok_status: 200
+            # to catch and store the result and use it later...
+            var_name: wsapi
+
+auth_configs:
+  prometheus_encrypted:
+    mode: script
+    user: prometheus
+    password: "/encrypted/__________XXXXXXX_______________XXXXXXX_______"
+
+# The targets to monitor and the collectors to execute on it.
+targets:
+  # default target is used as a pattern for exporter queries with target name not defined locally.
+  - name: default
+    scheme: https
+    host: template
+    auth_name: prometheus_encrypted
+    # auth_config:
+    #   # mode: basic|token|[anything else:=> user defined login script]
+    #   mode: script
+    #   user: usrNetScalerSupervision
+    #   password: "/encrypted/base64_encrypted_password_by_passwd_crypt_cmd"
+    collectors:
+      - ~.*_metrics
+
+  # optionally definitions of all other targets in file
+  - targets_files: [ "targets/*.yml" ]
+
+# Collector files specifies a list of globs. One collector definition is read from each matching file.
+collector_files:
+  - "metrics/*.collector.yml"
